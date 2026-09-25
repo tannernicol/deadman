@@ -1,0 +1,9 @@
+[Unit]
+Description=Commit a GitHub dead-man heartbeat
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/deadman
+ExecStart=%h/deadman/scripts/heartbeat.sh

@@ -1,0 +1,112 @@
+name: deadman
+
+# GitHub disables scheduled workflows after 60 days without repository activity.
+# The hourly heartbeat commits keep this workflow alive while doing useful work.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Set the repository variable HOST_NAME to name the machine. The fallback
+      # makes a new template work without configuration.
+      HOST_NAME: ${{ vars.HOST_NAME || 'my-server' }}
+      STALE_HOURS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate heartbeat age
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$HOST_NAME" in
+            ''|*/*|*..*|*[!A-Za-z0-9._-]*)
+              echo "invalid HOST_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          now=$(date -u +%s)
+          limit=$(( STALE_HOURS * 3600 ))
+          heartbeat="heartbeat/$HOST_NAME"
+          stale=true
+          age_h=unknown
+
+          # A missing, malformed, or future heartbeat fails closed: alert rather
+          # than assuming that a missing file means a healthy machine.
+          if [[ -f "$heartbeat" ]]; then
+            last=$(tr -d '[:space:]' < "$heartbeat")
+            if [[ "$last" =~ ^[0-9]+$ ]] && (( last <= now )); then
+              age=$(( now - last ))
+              age_h=$(( age / 3600 ))
+              if (( age <= limit )); then
+                stale=false
+              fi
+            fi
+          fi
+
+          echo "stale=$stale" >> "$GITHUB_OUTPUT"
+          echo "age_h=$age_h" >> "$GITHUB_OUTPUT"
+          echo "heartbeat=$heartbeat" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure alert label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create deadman --description "Heartbeat staleness alert" --color B60205 2>/dev/null || true
+          gh label list --json name --jq '.[] | select(.name == "deadman") | .name' | grep -qx deadman
+
+      # An open issue is the state. One open issue avoids a new alert every
+      # scheduled run and remains visible if the push notification is missed.
+      - name: Find existing heartbeat-lost issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          number=$(gh issue list --state open --label deadman --limit 1 --json number --jq '.[0].number // ""')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Raise alert
+        if: steps.check.outputs.stale == 'true' && steps.issue.outputs.number == ''
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          body="${HOST_NAME} has not checked in for ${{ steps.check.outputs.age_h }} hours.
+
+          The heartbeat file is \`${{ steps.check.outputs.heartbeat }}\`. Inspect the machine and its network connection."
+          gh issue create --title "${HOST_NAME} heartbeat lost" --label deadman --body "$body"
+          if [[ -n "${NTFY_URL:-}" ]]; then
+            curl -fsS --max-time 20 \
+              -H "Title: ${HOST_NAME} heartbeat lost" \
+              -H "Priority: min" \
+              -H "Tags: rotating_light" \
+              -d "$body" "$NTFY_URL" >/dev/null || echo "ntfy push failed (issue still filed)"
+          fi
+
+      - name: Clear alert on recovery
+        if: steps.check.outputs.stale == 'false' && steps.issue.outputs.number != ''
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh issue close "${{ steps.issue.outputs.number }}" --comment "Heartbeat resumed."
+          if [[ -n "${NTFY_URL:-}" ]]; then
+            curl -fsS --max-time 20 \
+              -H "Title: ${HOST_NAME} heartbeat back" \
+              -H "Priority: min" \
+              -H "Tags: white_check_mark" \
+              -d "Heartbeat resumed." "$NTFY_URL" >/dev/null || true
+          fi
